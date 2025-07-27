@@ -1,13 +1,16 @@
 # src/aq_weather_preprocess.py
-"""Preprocess Kraków air‑quality + weather **all the way to decoded JSON**.
+"""
+Preprocess Kraków air‑quality + weather all the way to decoded JSON.
 
-Changes (2025‑07‑27 – v3)
+Changes (2025‑07‑27 – v4)
 =========================
-* Weather decoded before JSON:
-  * TMP  → temp_c  (°C)
-  * WND  → wind_dir_deg, wind_speed_ms
-  * Raw strings optional via KEEP_RAW_WX.
-* PM₁₀: duplicates dropped, sentinels removed, ≤ 3 h gaps interpolated.
+* **Case granularity selectable** via ``case_scope`` parameter:
+  * ``"station"`` – original behaviour (one station per case)
+  * ``"day"``     – one calendar day per case with many stations inside
+* ``preprocess_all`` now accepts ``case_scope`` and forwards it to
+  :func:`build_cases`.
+* Internally caches weather by day for fast lookup when building day‑level
+  cases.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ MAX_GAP_HOURS  = 3          # interpolate gaps ≤ this length
 KEEP_RAW_WX    = False      # True → keep TMP/WND strings too
 
 # ─────────────── Weather decoders ───────────────────────────────────────────
+
 def _to_float_safe(tok: str | None, scale: float = 1.0) -> float | None:
     if tok in (None, "", "99999", "+99999", "9999", "+9999", "99"):
         return None
@@ -33,9 +37,11 @@ def _to_float_safe(tok: str | None, scale: float = 1.0) -> float | None:
     except ValueError:
         return None
 
+
 def _decode_tmp(tmp: str) -> Tuple[float | None, int | None]:
     parts = str(tmp).split(",")
     return _to_float_safe(parts[0], 10.0), int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+
 
 def _decode_wnd(wnd: str) -> Tuple[float | None, float | None, int | None, int | None]:
     parts = str(wnd).split(",")
@@ -49,6 +55,7 @@ def _decode_wnd(wnd: str) -> Tuple[float | None, float | None, int | None, int |
     )
 
 # ─────────────── Station metadata ───────────────────────────────────────────
+
 def load_station_meta(path: Path) -> pd.DataFrame:
     return (
         pd.read_excel(path)
@@ -60,11 +67,13 @@ def load_station_meta(path: Path) -> pd.DataFrame:
     )
 
 # ─────────────── PM10 handlers ──────────────────────────────────────────────
+
 def _read_single_pm10_excel(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path).rename(columns={"DateTime": "timestamp"})
     df = df.melt(id_vars="timestamp", var_name="station_code", value_name="pm10")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df
+
 
 def _impute_pm10(df: pd.DataFrame) -> pd.DataFrame:
     wide = df.pivot(index="timestamp", columns="station_code", values="pm10")
@@ -76,6 +85,7 @@ def _impute_pm10(df: pd.DataFrame) -> pd.DataFrame:
                  .dropna(subset=["pm10"]))
     return long
 
+
 def load_pm10_history(folder: Path) -> pd.DataFrame:
     files = sorted(folder.glob("*_PM10_1g.xlsx"))
     raw  = pd.concat([_read_single_pm10_excel(f) for f in files], ignore_index=True)
@@ -84,6 +94,7 @@ def load_pm10_history(folder: Path) -> pd.DataFrame:
     return _impute_pm10(clean).sort_values(["station_code", "timestamp"])
 
 # ─────────────── Weather handlers ───────────────────────────────────────────
+
 def _read_single_weather_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, usecols=["STATION", "DATE", "TMP", "WND"])
     df = df.rename(columns={"STATION": "station_id", "DATE": "date"})
@@ -95,69 +106,131 @@ def _read_single_weather_csv(path: Path) -> pd.DataFrame:
         df = df.drop(columns=["TMP", "WND"])
     return df.drop_duplicates(["station_id", "date"])
 
+
 def load_weather_raw(folder: Path) -> pd.DataFrame:
     return (pd.concat([_read_single_weather_csv(f) for f in sorted(folder.glob("*.csv"))], ignore_index=True)
               .sort_values(["station_id", "date"]))
 
 # ─────────────── Build JSON cases ───────────────────────────────────────────
+
 def build_cases(pm10: pd.DataFrame,
                 meta: pd.DataFrame,
                 weather: pd.DataFrame | None = None,
-                *, horizon_hours: int = 24) -> Dict[str, List[dict]]:
+                *,
+                horizon_hours: int = 24,
+                case_scope: str = "station") -> Dict[str, List[dict]]:
+    """Build the JSON dataset.
 
+    Parameters
+    ----------
+    pm10 : DataFrame – long‑format PM₁₀ data.
+    meta : DataFrame – station coordinates.
+    weather : DataFrame or None – decoded hourly weather.
+    horizon_hours : int – forecast horizon (not yet used for features).
+    case_scope : "station" | "day" – granularity of a case.
+    """
+
+    allowed = {"station", "day"}
+    if case_scope not in allowed:
+        raise ValueError(f"case_scope must be one of {allowed}")
+
+    # Merge coordinates once
     pm10_geo = pm10.merge(meta, on="station_code", how="left")
-    wx_records = []
+
+    # Pre‑index weather by day for quick attach
+    wx_by_day: Dict[pd.Timestamp, List[dict]] = {}
     if weather is not None and not weather.empty:
-        wx_records = [
-            {"date": d.isoformat(),
-             "temp_c": None if pd.isna(t) else round(t, 1),
-             "wind_dir_deg": wd,
-             "wind_speed_ms": ws}
-            for d, t, wd, ws in zip(weather["date"],
-                                    weather["temp_c"],
-                                    weather["wind_dir_deg"],
-                                    weather["wind_speed_ms"])
-        ]
+        weather = weather.copy()
+        weather["day"] = weather["date"].dt.normalize()
+        for d, g in weather.groupby("day"):
+            wx_by_day[d] = [
+                {"date": dt.isoformat(),
+                 "temp_c": None if pd.isna(t) else round(t, 1),
+                 "wind_dir_deg": wd,
+                 "wind_speed_ms": ws}
+                for dt, t, wd, ws in zip(g["date"],
+                                         g["temp_c"],
+                                         g["wind_dir_deg"],
+                                         g["wind_speed_ms"])
+            ]
 
-    cases = []
-    for i, (code, g) in enumerate(pm10_geo.groupby("station_code")):
-        g = g.sort_values("timestamp")
-        history = [{"timestamp": ts.isoformat(), "pm10": round(v, 4)}
-                   for ts, v in zip(g["timestamp"], g["pm10"])]
-        pred_start = (g["timestamp"].iloc[-1] + timedelta(hours=1)).isoformat()
+    cases: List[dict] = []
 
-        cases.append({
-            "case_id": f"case_{i:04d}",
-            "stations": [{
-                "station_code": code,
-                "longitude": g["longitude"].iat[0],
-                "latitude":  g["latitude"].iat[0],
-                "history":   history,
-            }],
-            "target": {
-                "longitude": g["longitude"].iat[0],
-                "latitude":  g["latitude"].iat[0],
-                "prediction_start_time": pred_start,
-            },
-            **({"weather": wx_records} if wx_records else {}),
-        })
+    # ── Per‑station case (legacy) ──────────────────────────────────────────
+    if case_scope == "station":
+        for code, g in pm10_geo.groupby("station_code"):
+            g = g.sort_values("timestamp")
+            history = [{"timestamp": ts.isoformat(), "pm10": round(v, 4)}
+                       for ts, v in zip(g["timestamp"], g["pm10"])]
+            pred_start = (g["timestamp"].iloc[-1] + timedelta(hours=1)).isoformat()
+            day = g["timestamp"].dt.normalize().iloc[-1]
+            cases.append({
+                "case_id": f"{code}_{day.date()}",
+                "stations": [{
+                    "station_code": code,
+                    "longitude": g["longitude"].iat[0],
+                    "latitude":  g["latitude"].iat[0],
+                    "history":   history,
+                }],
+                "target": {
+                    "longitude": g["longitude"].iat[0],
+                    "latitude":  g["latitude"].iat[0],
+                    "prediction_start_time": pred_start,
+                },
+                **({"weather": wx_by_day.get(day)} if wx_by_day else {}),
+            })
+
+    # ── Per‑day case (new) ────────────────────────────────────────────────
+    else:
+        pm10_geo = pm10_geo.copy()
+        pm10_geo["day"] = pm10_geo["timestamp"].dt.normalize()
+        for day, g_day in pm10_geo.groupby("day"):
+            stations_payload: List[dict] = []
+            for code, g_st in g_day.groupby("station_code"):
+                g_st = g_st.sort_values("timestamp")
+                history = [{"timestamp": ts.isoformat(), "pm10": round(v, 4)}
+                           for ts, v in zip(g_st["timestamp"], g_st["pm10"])]
+                stations_payload.append({
+                    "station_code": code,
+                    "longitude": g_st["longitude"].iat[0],
+                    "latitude":  g_st["latitude"].iat[0],
+                    "history":   history,
+                })
+            # Target = centre of mass of all stations that day
+            centres = g_day[["longitude", "latitude"]].mean()
+            pred_start = (day + timedelta(days=1)).isoformat()
+            cases.append({
+                "case_id": f"day_{day.date()}",
+                "stations": stations_payload,
+                "target": {
+                    "longitude": float(centres["longitude"]),
+                    "latitude":  float(centres["latitude"]),
+                    "prediction_start_time": pred_start,
+                },
+                **({"weather": wx_by_day.get(day)} if wx_by_day else {}),
+            })
+
     return {"cases": cases}
 
 # ─────────────── IO helpers ─────────────────────────────────────────────────
+
 def save_cases_to_json(cases: Dict, path: Path, *, indent: int = 2) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cases, f, indent=indent, ensure_ascii=False)
     print(f"✅  Saved {len(cases['cases'])} cases → {path}")
 
-def preprocess_all(aq_dir: Path, wx_dir: Path, out_json: Path) -> Dict:
+
+def preprocess_all(aq_dir: Path, wx_dir: Path, 
+                   *, case_scope: str = "station") -> Dict:
+    """End‑to‑end helper: load, clean, build, save."""
     meta   = load_station_meta(aq_dir / "Stations.xlsx")
     pm10   = load_pm10_history(aq_dir)
     wx     = load_weather_raw(wx_dir)
-    cases  = build_cases(pm10, meta, wx)
-    save_cases_to_json(cases, out_json)
+    cases  = build_cases(pm10, meta, wx, case_scope=case_scope)
     return cases
 
 # ─────────────── Flatten back for EDA ───────────────────────────────────────
+
 def flatten_cases_to_df(json_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
